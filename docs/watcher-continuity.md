@@ -41,7 +41,9 @@ The model no longer re-arms after ordinary wakes.
 No PreToolUse hook denies fleet commands based on watcher status.
 A genuine auto-arm failure describes the automatic mechanism as broken and never directs a routine manual background arm.
 Terminal arm-output classification (`started`, `attached`, or `FAILED`) remains defense in depth for the manual recovery path.
-Codex retains its bounded foreground checkpoint protocol.
+Codex's tracked Stop hook owns one bounded foreground checkpoint whenever the strict watcher predicate is unhealthy.
+It returns an actionable result to the forced continuation, and a quiet result also continues rather than permitting a blind stop, so the next Stop owns the successor checkpoint.
+The hook never backgrounds a watcher or calls `fm-watch-arm.sh`.
 Grok retains its tracked background-task notification protocol.
 No adapter starts a replacement with shell `&`.
 

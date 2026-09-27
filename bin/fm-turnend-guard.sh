@@ -47,15 +47,16 @@
 # are unchanged everywhere else, including for a dead daemon pid or a beacon
 # older than AFK_GRACE, which still block.
 #
-# Loop-guard, codex/Grok (default) mode: never block twice in the same turn.
-# Codex uses stop_hook_active and Grok uses stopHookActive; typed camel-case
-# takes precedence when both spellings are present. A true value means the
-# current stop attempt already follows a block, so this guard always allows it.
-# Passive harness adapters provide their own one-follow-up guard before calling
-# this script.
-# That bounds those harnesses to at most one forced continuation per turn -
-# never a wedged, un-endable session - while still nagging again on a later turn
-# if the problem persists.
+# Loop-guard, Grok/default mode: never block twice in the same turn.
+# Grok uses stopHookActive; typed camel-case takes precedence when both spellings
+# are present. A true value means the current stop attempt already follows a
+# block, so this guard allows it. Passive harness adapters provide their own
+# one-follow-up guard before calling this script.
+#
+# Codex is deliberately different. Its tracked Stop hook invokes this script
+# with --codex, which owns one foreground checkpoint at every unhealthy Stop.
+# It ignores stop_hook_active so the continuation after a quiet or actionable
+# checkpoint cannot silently end while workers are unobserved.
 #
 # Loop-guard, --claude mode (Stop-owned auto-arm cooperation): Claude Code
 # marks EVERY stop after ANY stop-hook-driven continuation stop_hook_active=true,
@@ -96,6 +97,7 @@ GRACE=${FM_GUARD_GRACE:-300}
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 CLAUDE_MODE=0
 CURSOR_MODE=0
+CODEX_MODE=0
 SYNC_WAIT_MS=${FM_CLAUDE_AUTOARM_SYNC_WAIT_MS:-800}
 EPOCH_FRESH=${FM_CLAUDE_AUTOARM_EPOCH_FRESH:-15}
 BLOCK_BUDGET=${FM_CLAUDE_TURNEND_BLOCK_BUDGET:-3}
@@ -107,7 +109,8 @@ for arg in "$@"; do
   case "$arg" in
     --claude) CLAUDE_MODE=1 ;;
     --cursor) CURSOR_MODE=1 ;;
-    *) echo "usage: $(basename "$0") [--claude|--cursor]" >&2; exit 2 ;;
+    --codex) CODEX_MODE=1 ;;
+    *) echo "usage: $(basename "$0") [--claude|--cursor|--codex]" >&2; exit 2 ;;
   esac
 done
 
@@ -146,7 +149,7 @@ STOP_HOOK_ACTIVE=$(printf '%s' "$PAYLOAD" | jq -r '
   else false
   end
 ' 2>/dev/null) || exit 0
-if [ "$CLAUDE_MODE" -eq 0 ] && [ "$STOP_HOOK_ACTIVE" = "true" ]; then
+if [ "$CLAUDE_MODE" -eq 0 ] && [ "$CODEX_MODE" -eq 0 ] && [ "$STOP_HOOK_ACTIVE" = "true" ]; then
   exit 0
 fi
 
@@ -196,6 +199,54 @@ allow_supervised_stop() {
 
 if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   allow_supervised_stop
+fi
+
+# Codex has no Stop-owned async rewake or parked hook. Its Stop hook instead
+# owns exactly one bounded foreground checkpoint. A quiet checkpoint still
+# returns exit 2, rather than allowing a blind stop, so the next Stop starts a
+# fresh cycle. An actionable checkpoint result is carried to that continuation
+# for normal durable queue drain and acknowledgement.
+if [ "$CODEX_MODE" -eq 1 ]; then
+  CHECKPOINT="$SCRIPT_DIR/fm-watch-checkpoint.sh"
+  CHECKPOINT_SECONDS=${FM_CODEX_WATCH_CHECKPOINT:-180}
+  case "$CHECKPOINT_SECONDS" in
+    ''|*[!0-9]*|0)
+      printf '%s\n' 'Codex supervision checkpoint is misconfigured; FM_CODEX_WATCH_CHECKPOINT must be a positive integer.' >&2
+      exit 2
+      ;;
+  esac
+  if [ "$CHECKPOINT_SECONDS" -gt 840 ]; then
+    printf '%s\n' 'Codex supervision checkpoint exceeds the 840-second hook safety budget; lower FM_CODEX_WATCH_CHECKPOINT before ending the turn.' >&2
+    exit 2
+  fi
+  if [ ! -x "$CHECKPOINT" ]; then
+    printf '%s\n' 'Codex supervision checkpoint is unavailable; restore bin/fm-watch-checkpoint.sh before ending the turn.' >&2
+    exit 2
+  fi
+  CHECKPOINT_OUT=$(mktemp "${TMPDIR:-/tmp}/fm-codex-turnend-checkpoint.out.XXXXXX") || {
+    printf '%s\n' 'Codex supervision checkpoint could not create its output capture; refusing a blind stop.' >&2
+    exit 2
+  }
+  trap 'rm -f "$CHECKPOINT_OUT"' EXIT
+  set +e
+  "$CHECKPOINT" --seconds "$CHECKPOINT_SECONDS" >"$CHECKPOINT_OUT" 2>&1
+  CHECKPOINT_RC=$?
+  set -e
+  cat "$CHECKPOINT_OUT" >&2
+  case "$CHECKPOINT_RC" in
+    0)
+      printf '%s\n' 'Codex hook-owned checkpoint surfaced an actionable wake. Drain and acknowledge the durable queue before continuing.' >&2
+      exit 2
+      ;;
+    124)
+      printf '%s\n' 'Codex hook-owned checkpoint was quiet. Continuing this turn keeps the next Stop responsible for the next foreground checkpoint.' >&2
+      exit 2
+      ;;
+    *)
+      printf '%s\n' "Codex hook-owned checkpoint failed (exit $CHECKPOINT_RC); refusing a blind stop and retrying at the next Stop." >&2
+      exit 2
+      ;;
+  esac
 fi
 
 # Away mode transfers supervision ownership from the watcher to the away-mode

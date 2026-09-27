@@ -176,6 +176,7 @@ install_guard_scripts() {
   local dir=$1
   mkdir -p "$dir/bin"
   cp "$ROOT/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard.sh"
+  cp "$ROOT/bin/fm-watch-checkpoint.sh" "$dir/bin/fm-watch-checkpoint.sh"
   cp "$ROOT/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-turnend-guard-grok.sh"
   cp "$ROOT/bin/fm-operational-input.sh" "$dir/bin/fm-operational-input.sh"
   cp "$ROOT/bin/fm-supervision-instructions.sh" "$dir/bin/fm-supervision-instructions.sh"
@@ -186,13 +187,13 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-hook-host-lib.sh" "$dir/bin/fm-hook-host-lib.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"
-  chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-operational-input.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
+  chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-watch-checkpoint.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-operational-input.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
 }
 
 mark_codex_hook_root() {
   local dir=$1
   mkdir -p "$dir/.codex"
-  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"fm-turnend-guard.sh"}]}]}}\n' > "$dir/.codex/hooks.json"
+  printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"fm-turnend-guard.sh --codex"}]}]}}\n' > "$dir/.codex/hooks.json"
 }
 
 # A primary-shaped checkout: plain (non-worktree) git repo, AGENTS.md, bin/,
@@ -263,6 +264,12 @@ run_hook() {
   printf '{"stop_hook_active":%s}' "$stop_active" | CLAUDECODE=1 FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
 }
 
+run_codex_hook() {
+  local dir=$1 stop_active=$2 home
+  home=$(cd "$dir" && pwd)
+  printf '{"stop_hook_active":%s}' "$stop_active" | FM_HOME="$home" bash "$dir/bin/fm-turnend-guard.sh" --codex 2>&1
+}
+
 nonexistent_pid() {
   local pid=999999
   while kill -0 "$pid" 2>/dev/null; do
@@ -305,6 +312,62 @@ test_hook_blocks_when_fresh_beacon_has_no_live_lock() {
   expect_code 2 "$status" "hook must block when a fresh beacon has no live watcher lock"
   assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
   pass "fm-turnend-guard: blocks when a fresh beacon has no live watcher lock"
+}
+
+test_codex_hook_owns_quiet_checkpoint_even_after_continuation() {
+  local dir out status calls
+  dir=$(make_primary_dir "$TMP_ROOT/codex-quiet-checkpoint")
+  : > "$dir/state/task1.meta"
+  cat > "$dir/bin/fm-watch-checkpoint.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_HOME/state/checkpoint.calls"
+printf '%s\n' 'checkpoint: no actionable wake within 1s'
+exit 124
+SH
+  chmod +x "$dir/bin/fm-watch-checkpoint.sh"
+  out=$(FM_CODEX_WATCH_CHECKPOINT=1 run_codex_hook "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must continue after a quiet checkpoint"
+  assert_contains "$out" 'checkpoint: no actionable wake within 1s' "quiet checkpoint output must reach the continuation"
+  assert_contains "$out" 'Codex hook-owned checkpoint was quiet' "quiet result must explain the managed handoff"
+  out=$(FM_CODEX_WATCH_CHECKPOINT=1 run_codex_hook "$dir" true); status=$?
+  expect_code 2 "$status" "Codex stop_hook_active must not allow a blind stop"
+  calls=$(wc -l < "$dir/state/checkpoint.calls" | tr -d ' ')
+  [ "$calls" = 2 ] || fail "Codex hook must own one checkpoint at each unhealthy Stop, got $calls"
+  pass "fm-turnend-guard: Codex owns quiet checkpoints across continuations"
+}
+
+test_codex_hook_surfaces_actionable_checkpoint_result() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/codex-actionable-checkpoint")
+  : > "$dir/state/task1.meta"
+  cat > "$dir/bin/fm-watch-checkpoint.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'signal: task1.status'
+exit 0
+SH
+  chmod +x "$dir/bin/fm-watch-checkpoint.sh"
+  out=$(FM_CODEX_WATCH_CHECKPOINT=1 run_codex_hook "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must continue to deliver an actionable checkpoint result"
+  assert_contains "$out" 'signal: task1.status' "actionable checkpoint output must reach the continuation"
+  assert_contains "$out" 'Drain and acknowledge the durable queue' "actionable result must preserve queue handling"
+  pass "fm-turnend-guard: Codex surfaces an actionable hook-owned checkpoint"
+}
+
+test_codex_hook_refuses_oversized_checkpoint_without_running_it() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/codex-oversized-checkpoint")
+  : > "$dir/state/task1.meta"
+  cat > "$dir/bin/fm-watch-checkpoint.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' ran > "$FM_HOME/state/checkpoint-ran"
+exit 0
+SH
+  chmod +x "$dir/bin/fm-watch-checkpoint.sh"
+  out=$(FM_CODEX_WATCH_CHECKPOINT=841 run_codex_hook "$dir" false); status=$?
+  expect_code 2 "$status" "Codex hook must refuse a checkpoint that exceeds its timeout budget"
+  assert_contains "$out" 'exceeds the 840-second hook safety budget' "oversized checkpoint must explain its refusal"
+  assert_absent "$dir/state/checkpoint-ran" "oversized checkpoint must not be launched"
+  pass "fm-turnend-guard: Codex bounds its hook-owned checkpoint"
 }
 
 test_hook_blocks_source_only_home() {
@@ -2205,6 +2268,9 @@ test_predicate_task_pr_poll_is_not_a_custom_check
 test_predicate_relay_shim_is_not_a_custom_check
 test_hook_silent_when_no_work_in_flight
 test_hook_blocks_when_fresh_beacon_has_no_live_lock
+test_codex_hook_owns_quiet_checkpoint_even_after_continuation
+test_codex_hook_surfaces_actionable_checkpoint_result
+test_codex_hook_refuses_oversized_checkpoint_without_running_it
 test_hook_blocks_source_only_home
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
