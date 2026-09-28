@@ -999,6 +999,25 @@ EOF
   pass ".codex/hooks.json: Stop hook ignores nested git root guard scripts"
 }
 
+test_codex_hook_returns_json_only_on_success() {
+  local command dir out err status
+  command=$(jq -r '.hooks.Stop[0].hooks[0].command // empty' "$ROOT/.codex/hooks.json")
+  dir=$(make_primary_dir "$TMP_ROOT/codex-stop-output")
+  mark_codex_hook_root "$dir"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$dir/bin/fm-turnend-guard.sh"
+  chmod +x "$dir/bin/fm-turnend-guard.sh"
+  out=$(printf '{"stop_hook_active":true}' | (cd "$dir" && bash -c "$command")); status=$?
+  expect_code 0 "$status" "Codex Stop allow must succeed"
+  [ "$out" = '{}' ] || fail "Codex Stop allow must return empty JSON, got: $out"
+  printf '#!/usr/bin/env bash\nprintf "repair supervision\\n" >&2\nexit 2\n' > "$dir/bin/fm-turnend-guard.sh"
+  err="$TMP_ROOT/codex-stop-output.err"
+  out=$(printf '{"stop_hook_active":false}' | (cd "$dir" && bash -c "$command") 2>"$err"); status=$?
+  expect_code 2 "$status" "Codex Stop block must preserve exit 2"
+  [ -z "$out" ] || fail "Codex Stop block must not return allow JSON"
+  assert_contains "$(cat "$err")" "repair supervision" "Codex Stop block must preserve its reason"
+  pass ".codex/hooks.json: Stop success returns JSON; block keeps exit 2 and stderr"
+}
+
 test_opencode_plugin_anchors_guard_to_worktree() {
   local plugin parent worktree_dir wrong_dir out status
   plugin="$ROOT/.opencode/plugins/fm-primary-turnend-guard.js"
@@ -2235,6 +2254,7 @@ test_grok_adapter_missing_jq_and_no_supervision_allow
 test_tracked_claude_entries_inert_under_grok
 test_codex_hook_uses_process_pwd_when_payload_cwd_is_outside_root
 test_codex_hook_ignores_nested_git_root_guard
+test_codex_hook_returns_json_only_on_success
 test_opencode_plugin_anchors_guard_to_worktree
 test_pi_extension_injects_once_per_logical_agent_run
 test_pi_extension_retries_after_followup_delivery_failure

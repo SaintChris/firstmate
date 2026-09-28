@@ -13,3 +13,7 @@ __pycache__/
 config/
 
 .tools/
+
+# Local machine config and tool state (not shared)
+.codex/config.toml
+.treehouse/
