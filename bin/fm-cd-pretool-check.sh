@@ -26,6 +26,9 @@
 #   ALLOW - exit 0 and no output.
 #   DENY - exit 2, a Claude-shaped deny object on stderr, and a Grok-shaped
 #          deny object on stdout unless --claude was supplied.
+#   REWRITE, --claude stdin - for a persistent-cd deny whose subshell-wrapped
+#          form the policy allows: exit 0 and a Claude allow object on stdout
+#          whose updatedInput runs the command as `( ... )`.
 #   DENY, --cursor - exit 0 and Cursor's own decision object on stdout. Cursor
 #          reads the returned object rather than the exit status.
 #   INERT - not the real primary checkout (a crewmate/scout task worktree or a
@@ -180,6 +183,20 @@ json_escape() {
 }
 
 DETAIL="[$CODE] $REASON"
+
+# Claude can rewrite a tool call, so for a Claude stdin payload a persistent-cd
+# deny becomes the subshell form the reason itself recommends: the same command
+# runs, but the shell's cwd never leaves the home. The wrapped command must pass
+# the same policy, otherwise the ordinary deny below still applies.
+if [ "$CLAUDE_MODE" -eq 1 ] && [ "$CODE" = "persistent-cd" ] && [ -n "${PAYLOAD:-}" ]; then
+  WRAPPED=$(printf '(\n%s\n)' "$CMD")
+  WRAPPED_DECISION=$(node "$POLICY" --command "$WRAPPED" 2>/dev/null) || WRAPPED_DECISION=""
+  if [ "${WRAPPED_DECISION%%"$TAB"*}" = "allow" ]; then
+    printf '%s' "$PAYLOAD" | jq -c --arg c "$WRAPPED" --arg r "$DETAIL (ran in a subshell instead)" \
+      '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",permissionDecisionReason:$r,updatedInput:((.tool_input // {}) + {command:$c})}}' \
+      2>/dev/null && exit 0
+  fi
+fi
 ESCAPED=$(json_escape "$DETAIL")
 if [ "$CURSOR_MODE" -eq 1 ]; then
   printf '{"permission":"deny","user_message":"%s"}\n' "$ESCAPED"
