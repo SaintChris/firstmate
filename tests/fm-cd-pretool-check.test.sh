@@ -183,6 +183,17 @@ run_matrix_entry() {
     return
   fi
 
+  if [ "$entry" = claude ] && [ "$rc" -eq 0 ]; then
+    # Claude stdin may instead rewrite the command into a policy-allowed subshell.
+    jq -e --arg c "$(printf '(\n%s\n)' "$cmd")" \
+      '.hookSpecificOutput.permissionDecision == "allow" and .hookSpecificOutput.updatedInput.command == $c and (.hookSpecificOutput.permissionDecisionReason | test("\\[persistent-cd\\]"))' \
+      "$out_file" >/dev/null 2>&1 \
+      || fail "$id via claude rewrite must allow with the subshell-wrapped command: $(cat "$out_file")"
+    [ ! -s "$err_file" ] || fail "$id via claude rewrite must leave stderr empty: $(cat "$err_file")"
+    node "$PRIMARY/bin/fm-cd-command-policy.mjs" --command "$(printf '(\n%s\n)' "$cmd")" | grep -q '^allow' \
+      || fail "$id via claude rewrite produced a command the policy denies"
+    return
+  fi
   [ "$rc" -eq 2 ] || fail "$id via $entry must deny, got exit $rc"
   jq -e '.hookSpecificOutput.permissionDecision == "deny" and (.systemMessage | test("\\[persistent-cd\\]"))' "$err_file" >/dev/null 2>&1 \
     || fail "$id via $entry deny must carry the persistent-cd reason code on stderr: $(cat "$err_file")"
